@@ -1,75 +1,70 @@
 # import pandas as pd
 import logging
+import os
 import sys
 import time
+import warnings
 
-from dask import config 
+import s3fs
+from dask import config
 from dask.distributed import LocalCluster
 from dotenv import load_dotenv
 
-from downscaling import run_downscaling_workflow,initialize_logger
 
+from downscaling import (
+    AORC_PATH_TEMPLATE,
+    NASA_FUTURE_PATH_TEMPLATE,
+    NASA_HISTORICAL_PATH_TEMPLATE,
+    initialize_logger,
+    run_downscaling_workflow,
+    init
+)
 
 # ----------------------TEST SCRIPT----------------------- #
-if __name__=="__main__":
-    client = LocalCluster().get_client()
-    print(client.dashboard_link)
+if __name__ == "__main__":
 
-    import logging
-    import os
-    import geopandas as gpd
-    import s3fs
-
-
-    from dotenv import load_dotenv
-    from shapely.geometry import box
-
-    load_dotenv()
-    config.set({"logging.distributed": "error"})
     initialize_logger()
-
+    client = LocalCluster().get_client()
     time.sleep(5)
-    logging.info(f"Starting test run {client.dashboard_link}")
+    print(client.dashboard_link)
+    
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO)
+    warnings.filterwarnings("ignore")
+    config.set({"logging.distributed": "error"})
+    
 
     # Set paths and parameters
-    shapefile = "/home/ubuntu/dask-sst-sandbox/tests/indian-creek.json"
-    # shapefile = "/mnt/tests/indian-creek.json"
-    aorc_path_template = "noaa-nws-aorc-v1-1-1km/{year}.zarr"
-    nasa_historical_path_template = (
-        "nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/historical/r1i1p1f1/pr/pr_day_{model}_historical_r1i1p1f1_gn_{year}.nc"
-    )
-    nasa_future_path_template = (
-        "nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/{ssp}/r1i1p1f1/pr/pr_day_{model}_{ssp}_r1i1p1f1_gn_{year}.nc"
-    )
-    output_dir = "s3://wejo-xfer/downscaled_future"  # Update this for your output location
+    aoi_file = "/home/ubuntu/dask-sst-sandbox/tests/indian-creek.json"
+
+    output_dir = "s3://wejo-xfer/downscaled_future/indian-creek-test"
 
     aorc_variable_name = "APCP_surface"
     nasa_variable_name = "pr"
 
-    # Set testing parameters
-    historical_years = [1980]  # [1980]  # Historical year for testing #list(range(1980, 2015)) for all historical years
-    future_years = [2015]  # Future year for testing
-    models = ["CanESM5"]
-    ssps = ["ssp245"]
-    buffer = 0.1
-    doys = [1]  # Example DOYs for testing, list(range(1, 366)) for all DOYs
+    historical_years = range(1980, 1981)
+    future_years = range(2015, 2016)
 
-    # Read shapefile and create buffered bounds
-    shape = gpd.read_file(shapefile)
-    projected_shape = shape.to_crs(epsg=4326)  # Replace with a projected CRS for your region
-    # Convert buffered bounds to a bounding box
-    minx, miny, maxx, maxy = shape.total_bounds
-    bounding_box = box(minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-    buffered_bounds = gpd.GeoDataFrame({"geometry": [bounding_box]}, crs=shape.crs)
+    models = ["CanESM5"]
+
+    ssps = ["ssp245"]
+
+    buffer = .1
+
+    doys = range(6,7)  # Example DOYs for testing, list(range(1, 366)) for all DOYs
+
+    aoi_gdf, buffered_bounds = init(aoi_file, buffer=buffer)
 
     # set up s3  connection
     s3 = s3fs.S3FileSystem(key=os.getenv("AWS_ACCESS_KEY_ID"), secret=os.getenv("AWS_SECRET_ACCESS_KEY"))
 
+    logging.info(f"Starting test run {client.dashboard_link}")
+
     future = run_downscaling_workflow(
-        shapefile=shape,
-        aorc_path_template=aorc_path_template,
-        nasa_historical_path_template=nasa_historical_path_template,
-        future_path_template=nasa_future_path_template,
+        aoi_gdf=aoi_gdf,
+        aorc_path_template=AORC_PATH_TEMPLATE,
+        nasa_historical_path_template=NASA_HISTORICAL_PATH_TEMPLATE,
+        future_path_template=NASA_FUTURE_PATH_TEMPLATE,
         historical_years=historical_years,
         future_years=future_years,
         models=models,

@@ -16,43 +16,17 @@ This script orchestrates the downscaling workflow for climate data, including th
 
 The script uses Dask for parallel processing and delayed execution, xarray for handling multi-dimensional arrays, and pyresample for regridding. The data is read from and saved to S3 using s3fs.
 
-Functions:
-- `process_historical_data`: Processes historical data by reading, organizing, and sorting data by DOY.
-- `process_future_data`: Processes future data by reading, organizing, and sorting data by DOY.
-- `fit_and_apply_quantile_map`: Fits quantile maps to historical data and applies them to future data for each DOY.
-- `compile_year_data`: Compiles the transformed future data for all DOYs of a specific year into one dataset.
-- `regrid_and_save`: Regrids the compiled year data to match the original AORC grid and saves the result to S3.
-- `run_downscaling_workflow`: Orchestrates the entire downscaling workflow, including processing historical and future data, fitting and applying quantile maps, compiling year data, regridding, and saving results.
-
-Usage:
-- Set the paths and parameters in the main section of the script.
-- Call the `run_downscaling_workflow` function with the appropriate arguments.
-
-Dependencies:
-- dask
-- xarray
-- pandas
-- cftime
-- numpy
-- skdownscale
-- s3fs
-- pyresample
-- fsspec
-- zarr
-- dotenv
-- geopandas
-- shapely
-
 """
 
 import logging
 import os
 from datetime import datetime, timedelta
-
+from shapely.geometry import box
 import cftime
 import fsspec
 import numpy as np
 import pandas as pd
+import geopandas as gpd
 import rioxarray
 import s3fs
 import xarray as xr
@@ -63,6 +37,57 @@ from pyresample import geometry, kd_tree
 from skdownscale.pointwise_models import QuantileMapper
 
 
+SUPPRESS_LOGS = ["boto3", "botocore", "geopandas", "fiona", "rasterio", "pyogrio", "xarray", "shapely"]
+
+AORC_PATH_TEMPLATE = "noaa-nws-aorc-v1-1-1km/{year}.zarr"
+NASA_HISTORICAL_PATH_TEMPLATE = (
+    "nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/historical/r1i1p1f1/pr/pr_day_{model}_historical_r1i1p1f1_gn_{year}.nc"
+)
+NASA_FUTURE_PATH_TEMPLATE = (
+    "nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/{ssp}/r1i1p1f1/pr/pr_day_{model}_{ssp}_r1i1p1f1_gn_{year}.nc"
+)
+
+def initialize_logger(json_logging: bool = False, level: int = logging.INFO):
+    datefmt = "%Y-%m-%dT%H:%M:%SZ"
+    if json_logging:
+        for module in SUPPRESS_LOGS:
+            logging.getLogger(module).setLevel(logging.WARNING)
+
+        class FlushStreamHandler(logging.StreamHandler):
+            def emit(self, record):
+                super().emit(record)
+                self.flush()
+
+        handler = FlushStreamHandler(sys.stdout)
+
+        logging.basicConfig(
+            level=level,
+            handlers=[handler],
+            format="""{"time": "%(asctime)s" , "level": "%(levelname)s", "msg": "%(message)s"}""",
+            datefmt=datefmt,
+        )
+    else:
+        for package in SUPPRESS_LOGS:
+            logging.getLogger(package).setLevel(logging.ERROR)
+        logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s", datefmt=datefmt)
+
+
+def init(aoi_file: str, log_level: int = logging.INFO, buffer: int = 0.1):
+    initialize_logger()
+    logging.info("Initialized environment variables")
+
+    # Read shapefile and create buffered bounds
+    aoi_gdf = gpd.read_file(aoi_file)
+    # TODO: Next line unused?
+    # projected_shape = aoi_gdf.to_crs(epsg=4326)  # Replace with a projected CRS for your region
+    # Convert buffered bounds to a bounding box
+    minx, miny, maxx, maxy = aoi_gdf.total_bounds
+    bounding_box = box(minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
+    buffered_bounds = gpd.GeoDataFrame({"geometry": [bounding_box]}, crs=aoi_gdf.crs)
+
+    return aoi_gdf, buffered_bounds
+
+
 #############
 ###PHASE 1###
 # reading, organizing, and sorting data by DOY
@@ -71,7 +96,7 @@ from skdownscale.pointwise_models import QuantileMapper
 def process_historical_data(
     aorc_path_template,
     nasa_historical_path_template,
-    shape,
+    aoi_gdf,
     buffered_bounds,
     aorc_variable_name,
     nasa_variable_name,
@@ -88,7 +113,7 @@ def process_historical_data(
     Parameters:
         aorc_path_template (str): Template path for AORC data on S3.
         nasa_historical_path_template (str): Template path for NASA historical data on S3.
-        shape (GeoDataFrame): Shapefile of the region of interest.
+        aoi_gdf (GeoDataFrame): aoi_gdf of the region of interest.
         buffered_bounds (GeoDataFrame): Buffered bounds of the region of interest.
         aorc_variable_name (str): Variable name for AORC data.
         nasa_variable_name (str): Variable name for NASA data.
@@ -103,6 +128,7 @@ def process_historical_data(
         aorc_combined (xarray.DataArray): Combined AORC historical data organized by DOY.
         original_aorc_grid (xarray.DataArray): Original AORC grid reference for regridding future data.
     """
+    initialize_logger()
     logging.info(f"Processing historical data for model: {model}, years {start_year}-{end_year}")
     nasa_data_list = []
     aorc_data_list = []
@@ -128,7 +154,7 @@ def process_historical_data(
 
             # Load AORC data
             try:
-                aorc_data = xr.open_zarr(s3.get_mapper(aorc_path_template.format(year=year)), chunks={"time": 24})[
+                aorc_data = xr.open_zarr(s3.get_mapper(aorc_path_template.format(year=year)), chunks={"time": "auto"})[
                     aorc_variable_name
                 ]
                 aorc_data = aorc_data.sel(time=slice(start_time, end_time))
@@ -146,7 +172,7 @@ def process_historical_data(
                 aorc_data = aorc_data.rio.write_crs("EPSG:4326", inplace=True)
                 aorc_data = aorc_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
 
-                aorc_clipped = aorc_data.rio.clip(buffered_bounds.geometry, shape.crs)
+                aorc_clipped = aorc_data.rio.clip(buffered_bounds.geometry, aoi_gdf.crs)
                 aorc_daily = aorc_clipped.resample(time="1D").sum()
 
                 # save the AORC grid once for reference
@@ -167,13 +193,13 @@ def process_historical_data(
             nasa_data = nasa_data.assign_coords(lon=(((nasa_data.lon + 180) % 360) - 180)).sortby("lon")
             nasa_data = nasa_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
             nasa_data = nasa_data.rio.write_crs("EPSG:4326", inplace=True)
-            nasa_clipped = nasa_data.rio.clip(buffered_bounds.geometry, shape.crs)
+            nasa_clipped = nasa_data.rio.clip(buffered_bounds.geometry, aoi_gdf.crs)
             nasa_daily = nasa_clipped * 86400
             nasa_daily.attrs["units"] = "kg/m^2"
 
             # Convert time to datetime64 within the function itself
             if isinstance(nasa_daily["time"].values[0], cftime.datetime):
-                print(f"Converting time to datetime64 for {nasa_variable_name} in year {year}")
+                logging.debug(f"Converting time to datetime64 for {nasa_variable_name} in year {year}")
                 nasa_daily["time"] = pd.to_datetime([t.strftime("%Y-%m-%d") for t in nasa_daily["time"].values])
 
             # Sort NASA data by DOY and filter by the specified DOYs
@@ -234,7 +260,7 @@ def process_historical_data(
 def process_future_data(
     nasa_future_path_template,
     buffered_bounds,
-    shape,
+    aoi_gdf,
     nasa_variable_name,
     quantile_mappers,
     aorc_combined,
@@ -254,7 +280,7 @@ def process_future_data(
     Parameters:
         nasa_future_path_template (str): Template path for NASA future data on S3.
         buffered_bounds (GeoDataFrame): Buffered bounds of the region of interest.
-        shape (GeoDataFrame): Shapefile of the region of interest.
+        aoi_gdf (GeoDataFrame): aoi_gdf of the region of interest.
         nasa_variable_name (str): Variable name for NASA data.
         quantile_mappers (dict): Dictionary of QuantileMapper objects for each DOY (not needed for this, set to None)
         aorc_combined (xarray.DataArray): Combined AORC historical data organized by DOY.
@@ -270,6 +296,7 @@ def process_future_data(
     Returns:
         nasa_future (xarray.DataArray): NASA future data organized by DOY.
     """
+    initialize_logger()
     logging.info(f"Processing future data for model: {model}, SSP: {ssp}, years {start_year}-{end_year}")
 
     nasa_future_list = []
@@ -278,19 +305,19 @@ def process_future_data(
         logging.info(f"Processing future data for year: {year}")
 
         # Load NASA future data
-        nasa_future = xr.open_dataset(s3.open(nasa_future_path_template.format(model=model, ssp=ssp, year=year)))[
-            nasa_variable_name
-        ]
+        nasa_future = xr.open_dataset(
+            s3.open(nasa_future_path_template.format(model=model, ssp=ssp, year=year)), chunks={"time": "auto"}
+        )[nasa_variable_name]
         nasa_future = nasa_future.assign_coords(lon=(((nasa_future.lon + 180) % 360) - 180)).sortby("lon")
         nasa_future = nasa_future.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
         nasa_future = nasa_future.rio.write_crs("EPSG:4326", inplace=True)
-        nasa_future_clipped = nasa_future.rio.clip(buffered_bounds.geometry, shape.crs)
+        nasa_future_clipped = nasa_future.rio.clip(buffered_bounds.geometry, aoi_gdf.crs)
         nasa_future_daily = nasa_future_clipped * 86400
         nasa_future_daily.attrs["units"] = "kg/m^2"
 
         # Convert time to datetime64 directly in the function
         if isinstance(nasa_future_daily["time"].values[0], cftime.datetime):
-            print(f"Converting time to datetime64 for {nasa_variable_name} in year {year}")
+            logging.debug(f"Converting time to datetime64 for {nasa_variable_name} in year {year}")
             nasa_future_daily["time"] = pd.to_datetime(
                 [t.strftime("%Y-%m-%d") for t in nasa_future_daily["time"].values]
             )
@@ -324,6 +351,7 @@ def fit_and_apply_quantile_map(aorc_data, nasa_data, nasa_future_data, doys):
     Returns:
         transformed_future_combined (xarray.DataArray): Transformed future data organized by DOY.
     """
+    initialize_logger()
     logging.info(f"Fitting and applying quantile mapping for {len(doys)} DOYs")
 
     quantile_mappers = {}
@@ -394,6 +422,7 @@ def fit_and_apply_quantile_map(aorc_data, nasa_data, nasa_future_data, doys):
 # compiling data by future year, regridding, and save to s3
 @delayed
 def compile_year_data(future_data_for_doys):
+    initialize_logger()
     """
     Compiles the transformed future data for all DOYs of a specific year into one dataset.
 
@@ -409,6 +438,7 @@ def compile_year_data(future_data_for_doys):
 
 @delayed
 def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, model, ssp, buffered_bounds):
+    initialize_logger()
     """
     Regrids the compiled year data to match the original AORC grid and saves the results to S3. After regridding is the final downscaled product.
 
@@ -455,10 +485,17 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
             source_lons, source_lats = np.meshgrid(source_lons, source_lats)
         source_grid = geometry.SwathDefinition(lons=source_lons, lats=source_lats)
 
+        # TODO print time only
+        logging.info(f"Regridding data for {year}, model {model}, SSP {ssp}, time {time_step}")
+        logging.debug(f"Targeting source: {source_grid.lons.shape}, {source_grid.lats.shape}")
+        if min(source_grid.lons.shape) < 8 or min(source_grid.lats.shape) < 8:
+            raise ValueError("Source grid is too small for regridding. Select a larger region or increase buffer size")
+
         # resample the current time slice
         regridded_slice = kd_tree.resample_gauss(
             source_grid, time_slice, target_grid, radius_of_influence=25000, sigmas=25000, fill_value=np.nan
         )
+
         regridded_slices.append(regridded_slice)
 
     # combine regridded slices along the time dimension
@@ -483,14 +520,28 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
 
     s3_store = s3fs.S3Map(root=output_file, s3=s3, check=False)
     zarr_store = zarr.storage.KVStore(s3_store)
-    regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=True)
 
-    logging.info(f"Saved regridded data for {year}, model {model}, SSP {ssp} to {output_file}")
+    try:
+        zarrfile_exits = xr.open_zarr(s3_store)
+        exists = True
+        zarrfile_exits.close()
+    except (FileNotFoundError, zarr.errors.GroupNotFoundError):
+        exists = False
+
+    if exists:
+        # TODO: Update to check if data already exists for this year, model, and SSP
+        # Handle all cases
+        regridded_data_da.to_zarr(store=zarr_store, mode="a", append_dim="time", consolidated=True)
+        logging.info(f"Saved regridded data for {year}, model {model}, SSP {ssp} to existing {output_file}")
+    else:
+        regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=True)
+        logging.info(f"Saved regridded data for {year}, model {model}, SSP {ssp} to new file {output_file}")
+
     return regridded_data_da
 
 
 def run_downscaling_workflow(
-    shapefile,
+    aoi_gdf,
     aorc_path_template,
     nasa_historical_path_template,
     future_path_template,
@@ -504,11 +555,12 @@ def run_downscaling_workflow(
     output_dir,
 ):
     import dask
+
     """
     Orchestrates the entire downscaling workflow, including processing historical and future data, fitting and applying quantile mpas, compiling year data, regridding, and saving results.
 
     Parameters:
-        shapefile (GeoDataFrame): Shapefile of the region of interest.
+        aoi_gdf (GeoDataFrame): aoi_gdf of the region of interest.
         aorc_path_template (str): Template path for AORC data on S3.
         nasa_historical_path_template (str): Template path for NASA historical data on S3.
         future_path_template (str): Template path for NASA future data on S3.
@@ -521,7 +573,7 @@ def run_downscaling_workflow(
         s3 (S3FileSystem): S3FileSystem object for reading and writing data to S3.
         output_dir (str): Output directory for saving regridded data.
     """
-
+    initialize_logger()
     # Phase 1: Process historical data
     logging.info("Phase 1: Processing historical data")
     historical_tasks = [
@@ -529,7 +581,7 @@ def run_downscaling_workflow(
             "task": process_historical_data(
                 aorc_path_template,
                 nasa_historical_path_template,
-                shape=shapefile,
+                aoi_gdf=aoi_gdf,
                 buffered_bounds=buffered_bounds,
                 aorc_variable_name="APCP_surface",
                 nasa_variable_name="pr",
@@ -556,7 +608,7 @@ def run_downscaling_workflow(
             "task": process_future_data(
                 future_path_template,
                 buffered_bounds,
-                shape=shapefile,
+                aoi_gdf=aoi_gdf,
                 nasa_variable_name="pr",
                 quantile_mappers=None,
                 aorc_combined=None,
@@ -614,7 +666,7 @@ def run_downscaling_workflow(
     ]
 
     # Visualize workflow
-    logging.info("Generating Dask workflow visualization")
+    # logging.info("Generating Dask workflow visualization")
     # all_tasks = (
     #     [task["task"] for task in historical_tasks]
     #     + [task["task"] for task in future_tasks]
@@ -628,29 +680,3 @@ def run_downscaling_workflow(
     logging.info("Starting computation of downscaling workflow")
     dask.compute(*regridded_tasks)
 
-SUPPRESS_LOGS = ["boto3", "botocore", "geopandas", "fiona", "rasterio", "pyogrio", "xarray", "shapely"]
-
-
-def initialize_logger(json_logging: bool = False, level: int = logging.INFO):
-    datefmt = "%Y-%m-%dT%H:%M:%SZ"
-    if json_logging:
-        for module in SUPPRESS_LOGS:
-            logging.getLogger(module).setLevel(logging.WARNING)
-
-        class FlushStreamHandler(logging.StreamHandler):
-            def emit(self, record):
-                super().emit(record)
-                self.flush()
-
-        handler = FlushStreamHandler(sys.stdout)
-
-        logging.basicConfig(
-            level=level,
-            handlers=[handler],
-            format="""{"time": "%(asctime)s" , "level": "%(levelname)s", "msg": "%(message)s"}""",
-            datefmt=datefmt,
-        )
-    else:
-        for package in SUPPRESS_LOGS:
-            logging.getLogger(package).setLevel(logging.ERROR)
-        logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s", datefmt=datefmt)
