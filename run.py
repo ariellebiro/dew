@@ -35,9 +35,10 @@ if __name__ == "__main__":
     
 
     # Set paths and parameters
-    aoi_file = "/home/ubuntu/dask-sst-sandbox/tests/indian-creek.json"
+    #aoi_file = "/mnt/tests/indian-creek.json"
+    aoi_file = "s3://wejo-xfer/duwamish/duwamish.geojson"
 
-    output_dir = "s3://wejo-xfer/downscaled_future/indian-creek-test"
+    output_dir = "s3://hydromet/downscaled_future/duwamish/"
 
     aorc_variable_name = "APCP_surface"
     nasa_variable_name = "pr"
@@ -45,13 +46,13 @@ if __name__ == "__main__":
     historical_years = range(1980, 1981)
     future_years = range(2015, 2016)
 
-    models = ["CanESM5"]
+    models = ["CESM2"]
 
     ssps = ["ssp245"]
 
-    buffer = .1
+    buffer = 0
 
-    doys = range(6,7)  # Example DOYs for testing, list(range(1, 366)) for all DOYs
+    doys = range(1,366)  # Example DOYs for testing, list(range(1, 366)) for all DOYs
 
     aoi_gdf, buffered_bounds = init(aoi_file, buffer=buffer)
 

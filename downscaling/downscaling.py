@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from shapely.geometry import box
 import cftime
 import fsspec
+import json
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -35,16 +36,17 @@ from dask import delayed
 from dotenv import load_dotenv
 from pyresample import geometry, kd_tree
 from skdownscale.pointwise_models import QuantileMapper
+import warnings
 
-
-SUPPRESS_LOGS = ["boto3", "botocore", "geopandas", "fiona", "rasterio", "pyogrio", "xarray", "shapely"]
+warnings.filterwarnings("ignore", category=UserWarning, module = "distributed.client")
+SUPPRESS_LOGS = ["boto3", "botocore", "geopandas", "fiona", "rasterio", "pyogrio", "xarray", "shapely", "zarr", "dask", "distributed"]
 
 AORC_PATH_TEMPLATE = "noaa-nws-aorc-v1-1-1km/{year}.zarr"
 NASA_HISTORICAL_PATH_TEMPLATE = (
-    "nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/historical/r1i1p1f1/pr/pr_day_{model}_historical_r1i1p1f1_gn_{year}.nc"
+    "s3://hydromet/nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/historical/r4i1p1f1/pr/pr_day_{model}_historical_r4i1p1f1_gn_{year}.json"
 )
 NASA_FUTURE_PATH_TEMPLATE = (
-    "nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/{ssp}/r1i1p1f1/pr/pr_day_{model}_{ssp}_r1i1p1f1_gn_{year}.nc"
+    "s3://hydromet/nex-gddp-cmip6/NEX-GDDP-CMIP6/{model}/{ssp}/r4i1p1f1/pr/pr_day_{model}_{ssp}_r4i1p1f1_gn_{year}.json"
 )
 
 def initialize_logger(json_logging: bool = False, level: int = logging.INFO):
@@ -78,7 +80,6 @@ def init(aoi_file: str, log_level: int = logging.INFO, buffer: int = 0.1):
 
     # Read shapefile and create buffered bounds
     aoi_gdf = gpd.read_file(aoi_file)
-    # TODO: Next line unused?
     # projected_shape = aoi_gdf.to_crs(epsg=4326)  # Replace with a projected CRS for your region
     # Convert buffered bounds to a bounding box
     minx, miny, maxx, maxy = aoi_gdf.total_bounds
@@ -86,7 +87,6 @@ def init(aoi_file: str, log_level: int = logging.INFO, buffer: int = 0.1):
     buffered_bounds = gpd.GeoDataFrame({"geometry": [bounding_box]}, crs=aoi_gdf.crs)
 
     return aoi_gdf, buffered_bounds
-
 
 #############
 ###PHASE 1###
@@ -180,16 +180,32 @@ def process_historical_data(
                     original_aorc_grid = aorc_clipped
 
                 # append AORC data for this doy
-                aorc_data_list.append(aorc_daily)
+                aorc_data_list.append(aorc_daily.chunk({'time':1}))
             except Exception as e:
                 logging.error(f"Error processing AORC data for DOY {doy} in year {year}: {e}")
                 continue
 
         try:
+            #path to kerchunk for historical data
+            kerchunk_json_path = nasa_historical_path_template.format(model=model, year=year)
+            #open kerchunk json and load references 
+            with fsspec.open(kerchunk_json_path, mode="r") as f:
+                nasa_data_refs = json.load(f)
+            #use fsspec to open as zarr
+            fs = fsspec.filesystem(
+                "reference", 
+                fo=nasa_data_refs,
+                target_options={"anon": True}, # ensure public access for nasa bucket
+                remote_protocol="s3",
+                remote_options={"anon": True}
+                )
+            
             # Load NASA historical data
-            nasa_data = xr.open_dataset(s3.open(nasa_historical_path_template.format(model=model, year=year)))[
-                nasa_variable_name
-            ]
+            fs_mapper = fs.get_mapper()
+            nasa_data = xr.open_zarr(fs_mapper, consolidated=False)[nasa_variable_name]
+            #extract only the doy needed without loading the full dataset
+            nasa_data = nasa_data.sel(time=nasa_data.time.dt.dayofyear.isin(doys))
+
             nasa_data = nasa_data.assign_coords(lon=(((nasa_data.lon + 180) % 360) - 180)).sortby("lon")
             nasa_data = nasa_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
             nasa_data = nasa_data.rio.write_crs("EPSG:4326", inplace=True)
@@ -206,7 +222,7 @@ def process_historical_data(
             nasa_daily = nasa_daily.sortby("time")
             nasa_daily = nasa_daily.sel(time=nasa_daily.time.dt.dayofyear.isin(doys))
 
-            nasa_data_list.append(nasa_daily)
+            nasa_data_list.append(nasa_daily.chunk({'time':1}))
         except Exception as e:
             logging.error(f"Error processing NASA data for year {year}: {e}")
             continue
@@ -305,9 +321,24 @@ def process_future_data(
         logging.info(f"Processing future data for year: {year}")
 
         # Load NASA future data
-        nasa_future = xr.open_dataset(
-            s3.open(nasa_future_path_template.format(model=model, ssp=ssp, year=year)), chunks={"time": "auto"}
-        )[nasa_variable_name]
+        kerchunk_json_path = nasa_future_path_template.format(model=model, ssp=ssp, year=year)
+        #open kerchunk json and load references
+        with fsspec.open(kerchunk_json_path, mode="r") as f:
+            nasa_future_refs = json.load(f)
+        #use fsspec to open as zarr
+        fs = fsspec.filesystem(
+                "reference", 
+                fo=nasa_future_refs,
+                target_options={"anon": True}, #ensure public access for nasa bucket
+                remote_protocol="s3",
+                remote_options={"anon": True}
+                )
+
+        #extract only doy of interest instead of the full dataset
+        fs_mapper = fs.get_mapper()
+        nasa_future = xr.open_zarr(fs_mapper, consolidated=False)[nasa_variable_name]
+        nasa_future = nasa_future.sel(time=nasa_future.time.dt.dayofyear.isin(doys))
+
         nasa_future = nasa_future.assign_coords(lon=(((nasa_future.lon + 180) % 360) - 180)).sortby("lon")
         nasa_future = nasa_future.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
         nasa_future = nasa_future.rio.write_crs("EPSG:4326", inplace=True)
@@ -437,7 +468,8 @@ def compile_year_data(future_data_for_doys):
 
 
 @delayed
-def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, model, ssp, buffered_bounds):
+def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, model, ssp, buffered_bounds, 
+                    overwrite=True): #set overwrite to true or false depending on if you want to overwrite the data here
     initialize_logger()
     """
     Regrids the compiled year data to match the original AORC grid and saves the results to S3. After regridding is the final downscaled product.
@@ -475,8 +507,14 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
 
     regridded_slices = []
 
+    #extract existing time information
+    existing_years = compiled_year_data["time"].dt.year.values.astype(str)
+    existing_doys = compiled_year_data["time"].dt.dayofyear.values.astype(str)
+
     # loop through time steps and regrid each slice
     for time_step in compiled_year_data["time"]:
+        #extract doy for current time step
+        doy = time_step.dt.dayofyear.values.item()
         # select data for current time step
         time_slice = compiled_year_data.sel(time=time_step).values
         source_lons = compiled_year_data["lon"].values
@@ -485,8 +523,9 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
             source_lons, source_lats = np.meshgrid(source_lons, source_lats)
         source_grid = geometry.SwathDefinition(lons=source_lons, lats=source_lats)
 
-        # TODO print time only
-        logging.info(f"Regridding data for {year}, model {model}, SSP {ssp}, time {time_step}")
+        # print time only
+        time_str = pd.to_datetime(str(time_step.values)).strftime("%Y-%m-%d")
+        logging.info(f"Regridding data for {year}, model {model}, SSP {ssp}, time {time_str}")
         logging.debug(f"Targeting source: {source_grid.lons.shape}, {source_grid.lats.shape}")
         if min(source_grid.lons.shape) < 8 or min(source_grid.lats.shape) < 8:
             raise ValueError("Source grid is too small for regridding. Select a larger region or increase buffer size")
@@ -495,7 +534,6 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
         regridded_slice = kd_tree.resample_gauss(
             source_grid, time_slice, target_grid, radius_of_influence=25000, sigmas=25000, fill_value=np.nan
         )
-
         regridded_slices.append(regridded_slice)
 
     # combine regridded slices along the time dimension
@@ -522,17 +560,24 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
     zarr_store = zarr.storage.KVStore(s3_store)
 
     try:
-        zarrfile_exits = xr.open_zarr(s3_store)
-        exists = True
-        zarrfile_exits.close()
-    except (FileNotFoundError, zarr.errors.GroupNotFoundError):
+        with xr.open_zarr(s3_store) as ds:
+            existing_years = ds["time"].dt.year.values.astype(str)
+            existing_doys = ds["time"].dt.dayofyear.values.astype(str)
+
+            #check if both year and DOY exist in dataset
+            if str(year) in existing_years and str(doy) in existing_doys:
+                exists = True
+            else:
+                exists = False
+    except (FileNotFoundError, zarr.errors.GroupNotFoundError, KeyError):
         exists = False
 
-    if exists:
-        # TODO: Update to check if data already exists for this year, model, and SSP
+    if exists and overwrite:
         # Handle all cases
-        regridded_data_da.to_zarr(store=zarr_store, mode="a", append_dim="time", consolidated=True)
-        logging.info(f"Saved regridded data for {year}, model {model}, SSP {ssp} to existing {output_file}")
+        logging.info(f"Overwriting existing data for {year}, DOY {doy}, model {model}, SSP {ssp} in {output_file}")
+        regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=True)
+    elif exists and not overwrite:
+        logging.info(f"Skipping existing data for {year}, model {model}, SSP {ssp} to existing {output_file}, overwrite=False")
     else:
         regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=True)
         logging.info(f"Saved regridded data for {year}, model {model}, SSP {ssp} to new file {output_file}")
@@ -679,4 +724,3 @@ def run_downscaling_workflow(
     # Trigger computation
     logging.info("Starting computation of downscaling workflow")
     dask.compute(*regridded_tasks)
-

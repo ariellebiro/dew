@@ -1,12 +1,10 @@
-FROM ghcr.io/dask/dask:2024.9.1-py3.12
+FROM ghcr.io/dask/dask:2025.1.0-py3.12
 
-ENV DEBIAN_FRONTEND="noninteractive"
+RUN conda install -n base conda-libmamba-solver
+RUN conda config --set solver libmamba
 
-
-
-ADD ./environment.yml .
-RUN mamba env update --file ./environment.yml &&\
-    conda clean -tipy
+COPY environment.yml .
+RUN conda env update -f environment.yml
 
 WORKDIR /mnt
 
@@ -14,13 +12,8 @@ COPY downscaling downscaling
 COPY tests tests
 COPY .env .
 COPY run.py .
-COPY launch.py .
-
-
-RUN echo "source activate dev" > ~/.bashrc
-ENV PATH /opt/conda/envs/dev/bin:$PATH
-
 
 RUN pip install ./downscaling 
 
-CMD ["sleep", "infinity"]
+CMD ["python", "run.py"]
+# CMD ["sleep", "infinity"]
