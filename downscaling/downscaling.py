@@ -37,8 +37,10 @@ from dotenv import load_dotenv
 from pyresample import geometry, kd_tree
 from skdownscale.pointwise_models import QuantileMapper
 import warnings
+from rasterio.errors import NotGeoreferencedWarning
 
 warnings.filterwarnings("ignore", category=UserWarning, module = "distributed.client")
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 SUPPRESS_LOGS = ["boto3", "botocore", "geopandas", "fiona", "rasterio", "pyogrio", "xarray", "shapely", "zarr", "dask", "distributed"]
 
 AORC_PATH_TEMPLATE = "noaa-nws-aorc-v1-1-1km/{year}.zarr"
@@ -94,14 +96,13 @@ def init(aoi_file: str, log_level: int = logging.INFO, buffer: int = 0.1):
 # separate functions for each dataset
 @delayed
 def process_historical_data(
+    year,
     aorc_path_template,
     nasa_historical_path_template,
     aoi_gdf,
     buffered_bounds,
     aorc_variable_name,
     nasa_variable_name,
-    start_year,
-    end_year,
     s3_private,
     s3_public,
     model,
@@ -130,97 +131,92 @@ def process_historical_data(
         original_aorc_grid (xarray.DataArray): Original AORC grid reference for regridding future data.
     """
     initialize_logger()
-    logging.info(f"Processing historical data for model: {model}, years {start_year}-{end_year}")
     nasa_data_list = []
     aorc_data_list = []
 
     # Initialize original AORC grid reference (to regrid future data)
     original_aorc_grid = None
 
-    for year in range(start_year, end_year + 1):
-        logging.info(f"Processing historical data for year: {year} (DOYS {sorted(doys)})")
+    logging.info(f"Processing historical data for model: {model}, year: {year} (DOYS {sorted(doys)})")
 
-        #determine if it's a leap year
-        is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
-        yearly_aorc_list=[]
+    #determine if it's a leap year
+    is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+    yearly_aorc_list=[]
 
-        for doy in doys:
-            #compute time range for this DOY
-            start_time = datetime(year, 1, 1) + timedelta(days=doy - 1)
-            end_time = start_time + timedelta(days=1) - timedelta(seconds=1)
-
-            logging.info(f"Processing historical data for DOY {doy} in year {year}")
-
-            try:
-                # Load AORC data
-                aorc_data = xr.open_zarr(
-                    s3_public.get_mapper(aorc_path_template.format(year=year)), chunks={"time": "auto"}
-                )[aorc_variable_name].sel(time=slice(start_time, end_time))
-
-                # Rename lat/lon for consistency
-                if "latitude" in aorc_data.coords and "longitude" in aorc_data.coords:
-                    aorc_data = aorc_data.rename({"latitude": "lat", "longitude": "lon"})
-
-                aorc_data = aorc_data.rio.write_crs("EPSG:4326", inplace=True)
-                aorc_data = aorc_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
-
-                aorc_clipped = aorc_data.rio.clip(buffered_bounds.geometry, buffered_bounds.crs)
-
-                if aorc_clipped.size == 0:
-                    logging.warning(f"AORC data for DOY {doy} in year {year} is empty after clipping.")
-                    continue  # Skip empty data
-
-                # Resample to daily
-                aorc_daily = aorc_clipped.resample(time="1D").sum()
-
-                #concatenate per DOY, only at the end)
-                yearly_aorc_list.append(aorc_daily.chunk({'time': 1}))
-
-                # Save the AORC grid once for reference
-                if original_aorc_grid is None:
-                    original_aorc_grid = aorc_clipped
-
-            except Exception as e:
-                logging.error(f"Error processing AORC data for DOY {doy} in year {year}: {e}")
-                continue
-
-        #concatenate all AORC data after collecting full year
-        if yearly_aorc_list:
-            aorc_data_list = xr.concat(yearly_aorc_list, dim="time")
+    for doy in doys:
+        #compute time range for this DOY
+        start_time = datetime(year, 1, 1) + timedelta(days=doy - 1)
+        end_time = start_time + timedelta(days=1) - timedelta(seconds=1)
 
         try:
-            with s3_private.open(nasa_historical_path_template.format(model=model, year=year), mode="r") as f:
-                nasa_data_refs = json.load(f)
+            # Load AORC data
+            aorc_data = xr.open_zarr(
+                s3_public.get_mapper(aorc_path_template.format(year=year)), chunks={"time": "auto"}
+            )[aorc_variable_name].sel(time=slice(start_time, end_time))
 
-            fs = fsspec.filesystem(
-                "reference",
-                fo=nasa_data_refs,
-                target_options={"anon": True},
-                remote_protocol="s3",
-                remote_options={"anon": True}
-            )
-            fs_mapper = fs.get_mapper()
-            nasa_data = xr.open_zarr(fs_mapper, consolidated=False)[nasa_variable_name]
+            # Rename lat/lon for consistency
+            if "latitude" in aorc_data.coords and "longitude" in aorc_data.coords:
+                aorc_data = aorc_data.rename({"latitude": "lat", "longitude": "lon"})
 
-            nasa_data = nasa_data.sel(time=nasa_data.time.dt.dayofyear.isin(doys))
-            nasa_data = nasa_data.assign_coords(lon=(((nasa_data.lon + 180) % 360) - 180)).sortby("lon")
-            nasa_data = nasa_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
-            nasa_data = nasa_data.rio.write_crs("EPSG:4326", inplace=True)
-            nasa_clipped = nasa_data.rio.clip(buffered_bounds.geometry, aoi_gdf.crs)
-            nasa_daily = nasa_clipped * 86400
-            nasa_daily.attrs["units"] = "kg/m^2"
+            aorc_data = aorc_data.rio.write_crs("EPSG:4326", inplace=True)
+            aorc_data = aorc_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
 
-            # Convert time to datetime64 within the function itself
-            if isinstance(nasa_daily["time"].values[0], cftime.datetime):
-                logging.debug(f"Converting time to datetime64 for {nasa_variable_name} in year {year}")
-                nasa_daily["time"] = pd.to_datetime([t.strftime("%Y-%m-%d") for t in nasa_daily["time"].values])
+            aorc_clipped = aorc_data.rio.clip(buffered_bounds.geometry, buffered_bounds.crs)
 
-            nasa_data_list.append(nasa_daily.chunk({'time':1}))
+            if aorc_clipped.size == 0:
+                logging.warning(f"AORC data for DOY {doy} in year {year} is empty after clipping.")
+                continue  # Skip empty data
 
-            logging.info(f"Processed NASA historical data for year {year} (DOYS: {sorted(doys)})")
+            # Resample to daily
+            aorc_daily = aorc_clipped.resample(time="1D").sum()
+
+            #concatenate per DOY, only at the end)
+            yearly_aorc_list.append(aorc_daily.chunk({'time': 1}))
+
+            # Save the AORC grid once for reference
+            if original_aorc_grid is None:
+                original_aorc_grid = aorc_clipped
+
         except Exception as e:
-            logging.error(f"Error processing NASA data for year {year}: {e}")
+            logging.error(f"Error processing AORC data for DOY {doy} in year {year}: {e}")
             continue
+
+    #concatenate all AORC data after collecting full year
+    if yearly_aorc_list:
+        aorc_data_list = xr.concat(yearly_aorc_list, dim="time")
+
+    try:
+        with s3_private.open(nasa_historical_path_template.format(model=model, year=year), mode="r") as f:
+            nasa_data_refs = json.load(f)
+
+        fs = fsspec.filesystem(
+            "reference",
+            fo=nasa_data_refs,
+            target_options={"anon": True},
+            remote_protocol="s3",
+            remote_options={"anon": True}
+        )
+        fs_mapper = fs.get_mapper()
+        nasa_data = xr.open_zarr(fs_mapper, consolidated=False)[nasa_variable_name]
+
+        nasa_data = nasa_data.sel(time=nasa_data.time.dt.dayofyear.isin(doys))
+        nasa_data = nasa_data.assign_coords(lon=(((nasa_data.lon + 180) % 360) - 180)).sortby("lon")
+        nasa_data = nasa_data.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
+        nasa_data = nasa_data.rio.write_crs("EPSG:4326", inplace=True)
+        nasa_clipped = nasa_data.rio.clip(buffered_bounds.geometry, aoi_gdf.crs)
+        nasa_daily = nasa_clipped * 86400
+        nasa_daily.attrs["units"] = "kg/m^2"
+
+        # Convert time to datetime64 within the function itself
+        if isinstance(nasa_daily["time"].values[0], cftime.datetime):
+            logging.debug(f"Converting time to datetime64 for {nasa_variable_name} in year {year}")
+            nasa_daily["time"] = pd.to_datetime([t.strftime("%Y-%m-%d") for t in nasa_daily["time"].values])
+
+        nasa_data_list.append(nasa_daily.chunk({'time':1}))
+
+        logging.info(f"Processed NASA historical data for year {year} (DOYS: {sorted(doys)})")
+    except Exception as e:
+        logging.error(f"Error processing NASA data for year {year}: {e}")
 
     #concatenate all AORC and NASA after processing all years
     nasa_combined = xr.concat(nasa_data_list, dim="time")
@@ -272,7 +268,7 @@ def process_historical_data(
 
     aorc_combined = aorc_combined.reindex(time=nasa_combined.time, method="nearest")
 
-    logging.info(f"Completed processing historical data for model: {model}")
+    logging.info(f"Completed processing historical data for model: {model}, year {year}")
     return nasa_combined, aorc_combined, original_aorc_grid
 
 
@@ -326,7 +322,6 @@ def process_future_data(
     for year in range(start_year, end_year + 1):
         for doy in doys:
             date = datetime(year, 1, 1) + pd.Timedelta(days=doy - 1)
-            logging.info(f"Processing future NASA data for DOY {doy} in year {year}")
 
         # Load NASA future data
         kerchunk_json_path = nasa_future_path_template.format(model=model, ssp=ssp, year=year)
@@ -616,6 +611,8 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
     return regridded_data_da
 
 
+
+
 def run_downscaling_workflow(
     aoi_gdf,
     aorc_path_template,
@@ -631,46 +628,60 @@ def run_downscaling_workflow(
     s3_private,
     s3_public,
 ):
-    import dask
+    from dask import delayed
+    import logging
+    import xarray as xr
 
     initialize_logger()
     logging.info("Phase 1: Processing historical data")
 
-    tasks = []
+    all_tasks = []
 
     for model in models:
         for ssp in ssps:
             logging.info(f"Preparing tasks for model {model}, SSP {ssp}")
 
-            #Phase 1: Historical (delayed)
-            historical = process_historical_data(
-                aorc_path_template,
-                nasa_historical_path_template,
-                aoi_gdf,
-                buffered_bounds,
-                aorc_variable_name="APCP_surface",
-                nasa_variable_name="pr",
-                start_year=min(historical_years),
-                end_year=max(historical_years),
-                s3_private=s3_private,
-                s3_public=s3_public,
-                model=model,
-                doys=doys,
-            )
+            # Step 1: Process historical data in parallel by year
+            historical_outputs = []
+            for year in historical_years:
+                hist = process_historical_data(
+                    year=year,
+                    aorc_path_template=aorc_path_template,
+                    nasa_historical_path_template=nasa_historical_path_template,
+                    aoi_gdf=aoi_gdf,
+                    buffered_bounds=buffered_bounds,
+                    aorc_variable_name="APCP_surface",
+                    nasa_variable_name="pr",
+                    s3_private=s3_private,
+                    s3_public=s3_public,
+                    model=model,
+                    doys=doys,
+                )
+                historical_outputs.append(hist)
 
-            #loop over each future year
+            # Step 2: Combine historical outputs
+            @delayed
+            def combine_histories(hist_outputs):
+                nasa_all = xr.concat([h[0] for h in hist_outputs], dim="time")
+                aorc_all = xr.concat([h[1] for h in hist_outputs], dim="time")
+                aorc_grid = hist_outputs[0][2]  # use grid from any one year
+                return nasa_all, aorc_all, aorc_grid
+
+            combined = combine_histories(historical_outputs)
+
+            # Step 3: Loop over future years
             for year in future_years:
-                logging.info(f"Preparing future year {year}")
+                logging.info(f"Queueing tasks for future year: {year}")
 
-                #Phase 1: Future (delayed)
-                future = process_future_data(
-                    future_path_template,
-                    buffered_bounds,
-                    aoi_gdf,
+                # Step 3.1: Process future data for the year
+                nasa_future = process_future_data(
+                    nasa_future_path_template=future_path_template,
+                    buffered_bounds=buffered_bounds,
+                    aoi_gdf=aoi_gdf,
                     nasa_variable_name="pr",
                     quantile_mappers=None,
-                    aorc_combined=historical[1],
-                    original_aorc_grid=historical[2],
+                    aorc_combined=combined[1],
+                    original_aorc_grid=combined[2],
                     start_year=year,
                     end_year=year,
                     output_dir=output_dir,
@@ -681,20 +692,19 @@ def run_downscaling_workflow(
                     doys=doys,
                 )
 
-                #Phase 2: Quantile Mapping (delayed)
+                # Step 3.2: Apply quantile mapping to the future data
                 mapped = fit_and_apply_quantile_map(
-                    aorc_data=historical[1],
-                    nasa_data=historical[0],
-                    nasa_future_data=future,
+                    aorc_data=combined[1],
+                    nasa_data=combined[0],
+                    nasa_future_data=nasa_future,
                     doys=doys,
                 )
 
-                #Phase 3: Compile & Regrid (delayed)
+                # Step 3.3: Compile and regrid the mapped data
                 compiled = compile_year_data([mapped])
-
                 regridded = regrid_and_save(
                     compiled_year_data=compiled,
-                    original_aorc_grid=historical[2],
+                    original_aorc_grid=combined[2],
                     output_dir=output_dir,
                     year=year,
                     model=model,
@@ -704,8 +714,20 @@ def run_downscaling_workflow(
                     overwrite=True,
                 )
 
-                tasks.append(regridded)
+                all_tasks.append(regridded)
 
-    return tasks
+    return all_tasks
+
+
+
+
+
+
+
+
+
+
+
+
 
 

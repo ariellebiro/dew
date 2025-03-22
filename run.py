@@ -24,7 +24,17 @@ from downscaling import (
 if __name__ == "__main__":
 
     initialize_logger()
-    client = LocalCluster().get_client()
+
+
+    #keep memory safe
+    cluster = LocalCluster(
+        n_workers=6,
+        threads_per_worker=1,
+        memory_limit="8GB",
+        dashboard_address=":8787",
+    )
+
+    client = cluster.get_client()
     time.sleep(5)
     print(client.dashboard_link)
     
@@ -43,8 +53,8 @@ if __name__ == "__main__":
     aorc_variable_name = "APCP_surface"
     nasa_variable_name = "pr"
 
-    historical_years = range(1980, 2014)
-    future_years = range(2015, 2016)
+    historical_years = range(1980, 1986)
+    future_years = range(2050, 2051)
 
     models = ["CESM2"]
 
@@ -52,7 +62,7 @@ if __name__ == "__main__":
 
     buffer = 1
 
-    doys = range(1, 366) 
+    doys = range(1, 90) 
     
      # Example DOYs for testing, list(range(1, 366)) for all DOYs
 
