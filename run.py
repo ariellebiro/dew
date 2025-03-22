@@ -4,9 +4,9 @@ import os
 import sys
 import time
 import warnings
-
+import fsspec
 import s3fs
-from dask import config
+from dask import config, compute
 from dask.distributed import LocalCluster
 from dotenv import load_dotenv
 
@@ -36,32 +36,35 @@ if __name__ == "__main__":
 
     # Set paths and parameters
     #aoi_file = "/mnt/tests/indian-creek.json"
-    aoi_file = "s3://wejo-xfer/duwamish/duwamish.geojson"
+    aoi_file = "/home/ubuntu/dask-sst-sandbox/tests/indian-creek.json"
 
-    output_dir = "s3://hydromet/downscaled_future/duwamish/"
+    output_dir = "s3://hydromet/downscaled_future/duwamish"
 
     aorc_variable_name = "APCP_surface"
     nasa_variable_name = "pr"
 
-    historical_years = range(1980, 1981)
+    historical_years = range(1980, 2014)
     future_years = range(2015, 2016)
 
     models = ["CESM2"]
 
     ssps = ["ssp245"]
 
-    buffer = 0
+    buffer = 1
 
-    doys = range(1,366)  # Example DOYs for testing, list(range(1, 366)) for all DOYs
+    doys = range(1, 366) 
+    
+     # Example DOYs for testing, list(range(1, 366)) for all DOYs
 
     aoi_gdf, buffered_bounds = init(aoi_file, buffer=buffer)
 
     # set up s3  connection
-    s3 = s3fs.S3FileSystem(key=os.getenv("AWS_ACCESS_KEY_ID"), secret=os.getenv("AWS_SECRET_ACCESS_KEY"))
+    s3_private = s3fs.S3FileSystem(key=os.getenv("AWS_ACCESS_KEY_ID"), secret=os.getenv("AWS_SECRET_ACCESS_KEY"))
+    s3_public = fsspec.filesystem("s3", anon=True)
 
     logging.info(f"Starting test run {client.dashboard_link}")
 
-    future = run_downscaling_workflow(
+    tasks = run_downscaling_workflow(
         aoi_gdf=aoi_gdf,
         aorc_path_template=AORC_PATH_TEMPLATE,
         nasa_historical_path_template=NASA_HISTORICAL_PATH_TEMPLATE,
@@ -72,7 +75,11 @@ if __name__ == "__main__":
         ssps=ssps,
         buffered_bounds=buffered_bounds,
         doys=doys,
-        s3=s3,
         output_dir=output_dir,
+        s3_private=s3_private,
+        s3_public=s3_public,
     )
+
+    results = compute(*tasks) #trigger execution
     logging.info("Test run completed successfully.")
+    client.close()
