@@ -53,8 +53,8 @@ if __name__ == "__main__":
     aorc_variable_name = "APCP_surface"
     nasa_variable_name = "pr"
 
-    historical_years = range(1980, 1986)
-    future_years = range(2050, 2051)
+    historical_years = range(1980, 2014)
+    future_years = range(2015, 2016)
 
     models = ["CESM2"]
 
@@ -62,7 +62,7 @@ if __name__ == "__main__":
 
     buffer = 1
 
-    doys = range(1, 90) 
+    doys = range(1, 30) 
     
      # Example DOYs for testing, list(range(1, 366)) for all DOYs
 
@@ -74,22 +74,24 @@ if __name__ == "__main__":
 
     logging.info(f"Starting test run {client.dashboard_link}")
 
-    tasks = run_downscaling_workflow(
-        aoi_gdf=aoi_gdf,
-        aorc_path_template=AORC_PATH_TEMPLATE,
-        nasa_historical_path_template=NASA_HISTORICAL_PATH_TEMPLATE,
-        future_path_template=NASA_FUTURE_PATH_TEMPLATE,
-        historical_years=historical_years,
-        future_years=future_years,
-        models=models,
-        ssps=ssps,
-        buffered_bounds=buffered_bounds,
-        doys=doys,
-        output_dir=output_dir,
-        s3_private=s3_private,
-        s3_public=s3_public,
-    )
+    for doy in doys:
+        logging.info(f"Processing DOY {doy}")
+        tasks = run_downscaling_workflow(
+            aoi_gdf=aoi_gdf,
+            aorc_path_template=AORC_PATH_TEMPLATE,
+            nasa_historical_path_template=NASA_HISTORICAL_PATH_TEMPLATE,
+            future_path_template=NASA_FUTURE_PATH_TEMPLATE,
+            historical_years=historical_years,
+            future_years=future_years,
+            models=models,
+            ssps=ssps,
+            buffered_bounds=buffered_bounds,
+            doys=[doy],
+            output_dir=output_dir,
+            s3_private=s3_private,
+            s3_public=s3_public,
+        )
 
-    results = compute(*tasks) #trigger execution
-    logging.info("Test run completed successfully.")
+        results = compute(*tasks) #trigger execution
+        logging.info("Test run completed successfully.")
     client.close()

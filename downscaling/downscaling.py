@@ -137,8 +137,6 @@ def process_historical_data(
     # Initialize original AORC grid reference (to regrid future data)
     original_aorc_grid = None
 
-    logging.info(f"Processing historical data for model: {model}, year: {year} (DOYS {sorted(doys)})")
-
     #determine if it's a leap year
     is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
     yearly_aorc_list=[]
@@ -172,6 +170,8 @@ def process_historical_data(
 
             #concatenate per DOY, only at the end)
             yearly_aorc_list.append(aorc_daily.chunk({'time': 1}))
+
+            logging.info(f"Processed AORC historical data for year {year} (DOYS: {sorted(doys)})")
 
             # Save the AORC grid once for reference
             if original_aorc_grid is None:
@@ -551,7 +551,7 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
 
         # print time only
         time_str = pd.to_datetime(str(time_step.values)).strftime("%Y-%m-%d")
-        logging.info(f"Regridding data for {year}, model {model}, SSP {ssp}, time {time_str}")
+        logging.info(f"Regridding data for DOY {doy}, {year}, model {model}, SSP {ssp}, time {time_str}")
         logging.debug(f"Targeting source: {source_grid.lons.shape}, {source_grid.lats.shape}")
         if min(source_grid.lons.shape) < 8 or min(source_grid.lats.shape) < 8:
             raise ValueError("Source grid is too small for regridding. Select a larger region or increase buffer size")
@@ -580,7 +580,7 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
     regridded_data_da = regridded_data_da.rename("pr")
 
     # Save the regrided data to S3
-    output_file = f"{output_dir}/{model}_{ssp}_{year}_regridded.zarr"
+    output_file = f"{output_dir}/{model}_{ssp}_{year}_DOY{doy:03d}_regridded.zarr"
 
     s3_store = s3fs.S3Map(root=output_file, s3=s3_private, check=False)
     zarr_store = zarr.storage.KVStore(s3_store)
@@ -590,7 +590,7 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
             existing_years = ds["time"].dt.year.values.astype(str)
             existing_doys = ds["time"].dt.dayofyear.values.astype(str)
 
-            #check if both year and DOY exist in dataset
+            #check if both year and DOY exist in dataset 
             if str(year) in existing_years and str(doy) in existing_doys:
                 exists = True
             else:
@@ -600,17 +600,15 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
 
     if exists and overwrite:
         # Handle all cases
-        logging.info(f"Overwriting existing data for {year}, DOYs {doy}, model {model}, SSP {ssp} in {output_file}")
-        regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=True)
+        logging.info(f"Overwriting existing data for DOY {doy}, {year}, DOYs {doy}, model {model}, SSP {ssp} in {output_file}")
+        regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=False)
     elif exists and not overwrite:
-        logging.info(f"Skipping existing data for {year}, model {model}, SSP {ssp} to existing {output_file}, overwrite=False")
+        logging.info(f"Skipping existing data for DOY {doy}, {year}, model {model}, SSP {ssp} to existing {output_file}, overwrite=False")
     else:
-        regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=True)
-        logging.info(f"Saved regridded data for {year}, model {model}, SSP {ssp} to new file {output_file}")
+        regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=False)
+        logging.info(f"Saved regridded data for DOY {doy}, {year}, model {model}, SSP {ssp} to new file {output_file}")
 
     return regridded_data_da
-
-
 
 
 def run_downscaling_workflow(
@@ -639,84 +637,108 @@ def run_downscaling_workflow(
 
     for model in models:
         for ssp in ssps:
-            logging.info(f"Preparing tasks for model {model}, SSP {ssp}")
+            for doy in doys:
+                logging.info(f"Preparing tasks for model {model}, SSP {ssp}")
 
-            # Step 1: Process historical data in parallel by year
-            historical_outputs = []
-            for year in historical_years:
-                hist = process_historical_data(
-                    year=year,
-                    aorc_path_template=aorc_path_template,
-                    nasa_historical_path_template=nasa_historical_path_template,
-                    aoi_gdf=aoi_gdf,
-                    buffered_bounds=buffered_bounds,
-                    aorc_variable_name="APCP_surface",
-                    nasa_variable_name="pr",
-                    s3_private=s3_private,
-                    s3_public=s3_public,
-                    model=model,
-                    doys=doys,
-                )
-                historical_outputs.append(hist)
+                # Step 1: Process historical data in parallel by year
+                historical_outputs = []
+                for year in historical_years:
+                    hist = process_historical_data(
+                        year=year,
+                        aorc_path_template=aorc_path_template,
+                        nasa_historical_path_template=nasa_historical_path_template,
+                        aoi_gdf=aoi_gdf,
+                        buffered_bounds=buffered_bounds,
+                        aorc_variable_name="APCP_surface",
+                        nasa_variable_name="pr",
+                        s3_private=s3_private,
+                        s3_public=s3_public,
+                        model=model,
+                        doys=[doy],
+                    )
+                    historical_outputs.append(hist)
 
-            # Step 2: Combine historical outputs
-            @delayed
-            def combine_histories(hist_outputs):
-                nasa_all = xr.concat([h[0] for h in hist_outputs], dim="time")
-                aorc_all = xr.concat([h[1] for h in hist_outputs], dim="time")
-                aorc_grid = hist_outputs[0][2]  # use grid from any one year
-                return nasa_all, aorc_all, aorc_grid
+                # Step 2: Combine historical outputs
+                @delayed
+                def combine_histories(hist_outputs):
+                    nasa_all = xr.concat([h[0] for h in hist_outputs], dim="time")
+                    aorc_all = xr.concat([h[1] for h in hist_outputs], dim="time")
+                    aorc_grid = hist_outputs[0][2]  # use grid from any one year
+                    return nasa_all, aorc_all, aorc_grid
 
-            combined = combine_histories(historical_outputs)
+                combined = combine_histories(historical_outputs)
 
-            # Step 3: Loop over future years
-            for year in future_years:
-                logging.info(f"Queueing tasks for future year: {year}")
+                # Step 3: Loop over future years
+                for year in future_years:
+                    logging.info(f"Queueing tasks for future year: {year}")
 
-                # Step 3.1: Process future data for the year
-                nasa_future = process_future_data(
-                    nasa_future_path_template=future_path_template,
-                    buffered_bounds=buffered_bounds,
-                    aoi_gdf=aoi_gdf,
-                    nasa_variable_name="pr",
-                    quantile_mappers=None,
-                    aorc_combined=combined[1],
-                    original_aorc_grid=combined[2],
-                    start_year=year,
-                    end_year=year,
-                    output_dir=output_dir,
-                    s3_private=s3_private,
-                    s3_public=s3_public,
-                    model=model,
-                    ssp=ssp,
-                    doys=doys,
-                )
+                    # Step 3.1: Process future data for the year
+                    nasa_future = process_future_data(
+                        nasa_future_path_template=future_path_template,
+                        buffered_bounds=buffered_bounds,
+                        aoi_gdf=aoi_gdf,
+                        nasa_variable_name="pr",
+                        quantile_mappers=None,
+                        aorc_combined=combined[1],
+                        original_aorc_grid=combined[2],
+                        start_year=year,
+                        end_year=year,
+                        output_dir=output_dir,
+                        s3_private=s3_private,
+                        s3_public=s3_public,
+                        model=model,
+                        ssp=ssp,
+                        doys=[doy],
+                    )
 
-                # Step 3.2: Apply quantile mapping to the future data
-                mapped = fit_and_apply_quantile_map(
-                    aorc_data=combined[1],
-                    nasa_data=combined[0],
-                    nasa_future_data=nasa_future,
-                    doys=doys,
-                )
+                    # Step 3.2: Apply quantile mapping to the future data
+                    mapped = fit_and_apply_quantile_map(
+                        aorc_data=combined[1],
+                        nasa_data=combined[0],
+                        nasa_future_data=nasa_future,
+                        doys=[doy],
+                    )
 
-                # Step 3.3: Compile and regrid the mapped data
-                compiled = compile_year_data([mapped])
-                regridded = regrid_and_save(
-                    compiled_year_data=compiled,
-                    original_aorc_grid=combined[2],
-                    output_dir=output_dir,
-                    year=year,
-                    model=model,
-                    ssp=ssp,
-                    buffered_bounds=buffered_bounds,
-                    s3_private=s3_private,
-                    overwrite=True,
-                )
+                    # Step 3.3: Compile and regrid the mapped data
+                    compiled = compile_year_data([mapped])
+                    regridded = regrid_and_save(
+                        compiled_year_data=compiled,
+                        original_aorc_grid=combined[2],
+                        output_dir=output_dir,
+                        year=year,
+                        model=model,
+                        ssp=ssp,
+                        buffered_bounds=buffered_bounds,
+                        s3_private=s3_private,
+                        overwrite=True,
+                    )
 
-                all_tasks.append(regridded)
+                    all_tasks.append(regridded)
 
     return all_tasks
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
