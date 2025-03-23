@@ -392,7 +392,7 @@ def fit_and_apply_quantile_map(aorc_data, nasa_data, nasa_future_data, doys):
         transformed_future_combined (xarray.DataArray): Transformed future data organized by DOY.
     """
     initialize_logger()
-    logging.info(f"Fitting and applying quantile mapping for {len(doys)} DOYs")
+    logging.info(f"Fitting and applying quantile mapping for {doy} DOYs")
 
     quantile_mappers = {}
 
