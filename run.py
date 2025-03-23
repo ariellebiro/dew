@@ -62,7 +62,7 @@ if __name__ == "__main__":
 
     buffer = 1
 
-    doys = range(1,30) 
+    doys = range(1,366) 
     
      # Example DOYs for testing, list(range(1, 366)) for all DOYs
 
@@ -74,9 +74,8 @@ if __name__ == "__main__":
 
     logging.info(f"Starting test run {client.dashboard_link}")
 
-    futures = []
     for doy in doys:
-        logging.info(f"Submitting DOY {doy} to cluster.")
+        logging.info(f"Processing DOY {doy}")
         tasks = run_downscaling_workflow(
             aoi_gdf=aoi_gdf,
             aorc_path_template=AORC_PATH_TEMPLATE,
@@ -93,17 +92,6 @@ if __name__ == "__main__":
             s3_public=s3_public,
         )
 
-        future_list = client.compute(tasks)
-        for f in future_list:
-            futures.append((doy, f))
-        
-    for completed in as_completed([f for _, f in futures]):
-        doy = next(doy for doy, fut in futures if fut == completed)
-        try: 
-            result = completed.result()
-            logging.info(f"DOY {doy:03d} completed successfully.")
-        except Exception as e:
-            logging.error(f"DOY {doy:03d} failed with error: {e}")
-
-    logging.info("All DOYs completed.")
+        results = compute(*tasks) #trigger execution
+        logging.info("Completed DOY {doy} successfully.")
     client.close()

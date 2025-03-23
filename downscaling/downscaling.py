@@ -392,7 +392,7 @@ def fit_and_apply_quantile_map(aorc_data, nasa_data, nasa_future_data, doys):
         transformed_future_combined (xarray.DataArray): Transformed future data organized by DOY.
     """
     initialize_logger()
-    logging.info(f"Fitting and applying quantile mapping for {doy} DOYs")
+    logging.info(f"Fitting and applying quantile mapping for DOYs: {doys}")
 
     quantile_mappers = {}
 
@@ -586,7 +586,7 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
     zarr_store = zarr.storage.KVStore(s3_store)
 
     try:
-        with xr.open_zarr(s3_store) as ds:
+        with xr.open_zarr(s3_store, consolidated=False) as ds:
             existing_years = ds["time"].dt.year.values.astype(str)
             existing_doys = ds["time"].dt.dayofyear.values.astype(str)
 
@@ -606,7 +606,7 @@ def regrid_and_save(compiled_year_data, original_aorc_grid, output_dir, year, mo
         logging.info(f"Skipping existing data for DOY {doy}, {year}, model {model}, SSP {ssp} to existing {output_file}, overwrite=False")
     else:
         regridded_data_da.to_zarr(store=zarr_store, mode="w", consolidated=False)
-        logging.info(f"Saved regridded data for DOY {doy}, {year}, model {model}, SSP {ssp} to new file {output_file}")
+        logging.info(f"Saved regridded data for DOY {doy}, {year}, model {model}, SSP {ssp} to {output_file}")
 
     return regridded_data_da
 
@@ -716,10 +716,6 @@ def run_downscaling_workflow(
                     all_tasks.append(regridded)
 
     return all_tasks
-
-
-
-
 
 
 
