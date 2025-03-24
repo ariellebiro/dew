@@ -28,9 +28,9 @@ if __name__ == "__main__":
 
     #keep memory safe
     cluster = LocalCluster(
-        n_workers=6,
+        n_workers=12,
         threads_per_worker=1,
-        memory_limit="8GB",
+        memory_limit="4GB",
         dashboard_address=":8787",
     )
 
@@ -46,14 +46,15 @@ if __name__ == "__main__":
 
     # Set paths and parameters
     #aoi_file = "/mnt/tests/indian-creek.json"
-    aoi_file = "/home/ubuntu/dask-sst-sandbox/tests/indian-creek.json"
+    aoi_file = "s3://wejo-xfer/duwamish/duwamish.geojson"
+    #"/home/ubuntu/dask-sst-sandbox/tests/indian-creek.json"
 
     output_dir = "s3://hydromet/downscaled_future/duwamish"
 
     aorc_variable_name = "APCP_surface"
     nasa_variable_name = "pr"
 
-    historical_years = range(1980, 2014)
+    historical_years = range(1980, 2015)
     future_years = range(2015, 2016)
 
     models = ["CESM2"]
@@ -62,10 +63,8 @@ if __name__ == "__main__":
 
     buffer = 1
 
-    doys = range(1,366) 
+    doys = range(1,5) #change this to range(1, 366) for all DOYs
     
-     # Example DOYs for testing, list(range(1, 366)) for all DOYs
-
     aoi_gdf, buffered_bounds = init(aoi_file, buffer=buffer)
 
     # set up s3  connection
